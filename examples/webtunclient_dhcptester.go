@@ -41,7 +41,7 @@ func main() {
 	}
 
 	// Start the client.
-	if err := client.Start(); err != nil {
+	if err := client.StartDHCPTest(); err != nil {
 		glog.Exit(err)
 	}
 

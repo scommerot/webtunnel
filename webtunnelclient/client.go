@@ -14,7 +14,9 @@ import (
 	"sync"
 	"time"
 
-	wc "github.com/deepakkamesh/webtunnel/webtunnelcommon"
+	// wc "github.com/deepakkamesh/webtunnel/webtunnelcommon"
+	wc "webtunnel/webtunnelcommon"
+
 	"github.com/golang/glog"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -96,6 +98,7 @@ func NewWebtunnelClient(serverIPPort string, wsDialer *websocket.Dialer,
 	if isTap {
 		devType = water.DeviceType(water.TAP)
 	}
+	glog.V(1).Infof("DeviceType: %v", devType)
 
 	return &WebtunnelClient{
 		Error:        make(chan error),
@@ -128,6 +131,85 @@ func (w *WebtunnelClient) PingHandler(wsConn *websocket.Conn) func(appStr string
 	}
 }
 
+// Start a DHCP tester.
+func (w *WebtunnelClient) StartDHCPTest() error {
+	glog.V(1).Info("Initialize TAP network interface")
+	handle, err := NewWaterInterface(water.Config{
+		DeviceType: w.devType,
+		/*PlatformSpecificParams: water.PlatformSpecificParams{
+			//ComponentID:   "tap_ovpnconnect",
+			ComponentID: "tapoas",
+			//InterfaceName: "Local Area Connection",
+			InterfaceName: "Local Area Connection 2",
+			Network:       "192.168.1.0/24",
+		},*/
+	})
+
+	w.ifce = &Interface{
+		Interface: handle,
+		LeaseTime: w.leaseTime,
+	}
+
+	// Configure network interface.
+	glog.V(1).Info("Configure network interface")
+	err = w.configureInterfaceHelper(
+		"10.0.0.3", "10.0.0.1", "255.255.255.0", []string{"8.8.8.8"}, []string{"10.1.0.0/24"}, wc.GenMACAddr(),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Start packet processors.
+	go w.processDHCPTestPacket()
+
+	return nil
+}
+
+func (w *WebtunnelClient) processDHCPTestPacket() {
+	pkt := make([]byte, 2048)
+	var oPkt []byte
+
+	w.ifce.LocalHWAddr = GetMacbyName(w.ifce.Name())
+	glog.V(1).Infof("Local Mac Hwdr: %v", w.ifce.LocalHWAddr)
+
+	for {
+		// Read from TUN/TAP network interface.
+		w.ifReadLock.Lock()
+		n, err := w.ifce.Read(pkt)
+		w.ifReadLock.Unlock()
+		if err != nil {
+			// Gracefully exit goroutine.
+			if w.isStopped {
+				return
+			}
+			w.Error <- fmt.Errorf("error reading Tunnel %s. Sz:%v", err, n)
+			return
+		}
+		oPkt = pkt[:n]
+
+		w.packetCnt++
+		w.bytesCnt += n
+
+		// Special handling for TAP; ARP/DHCP.
+		if w.ifce.IsTAP() {
+			packet := gopacket.NewPacket(oPkt, layers.LayerTypeEthernet, gopacket.Default)
+			if _, ok := packet.Layer(layers.LayerTypeARP).(*layers.ARP); ok {
+				if err := w.handleArp(packet); err != nil {
+					w.Error <- fmt.Errorf("err sending arp %v", err)
+				}
+				continue
+			}
+			if _, ok := packet.Layer(layers.LayerTypeDHCPv4).(*layers.DHCPv4); ok {
+				glog.V(1).Info("DHCP packet detected")
+				if err := w.handleDHCP(packet); err != nil {
+					w.Error <- fmt.Errorf("err sending dhcp  %v", err)
+				}
+				continue
+			}
+		}
+	}
+}
+
 // Start the client.
 func (w *WebtunnelClient) Start() error {
 
@@ -141,8 +223,16 @@ func (w *WebtunnelClient) Start() error {
 	w.isWSReady = true
 
 	// Start network interface.
+	glog.V(1).Info("Initialize TAP network interface")
 	handle, err := NewWaterInterface(water.Config{
 		DeviceType: w.devType,
+		/*PlatformSpecificParams: water.PlatformSpecificParams{
+			//ComponentID:   "tap_ovpnconnect",
+			ComponentID: "tapoas",
+			//InterfaceName: "Local Area Connection",
+			InterfaceName: "Local Area Connection 2",
+			Network:       "192.168.1.0/24",
+		},*/
 	})
 	if err != nil {
 		return fmt.Errorf("error creating int %s", err)
@@ -153,6 +243,7 @@ func (w *WebtunnelClient) Start() error {
 	}
 
 	// Configure network interface.
+	glog.V(1).Info("Configure network interface")
 	err = w.configureInterface()
 	if err != nil {
 		return err
@@ -196,6 +287,29 @@ func (w *WebtunnelClient) getUserInfo() (string, error) {
 	}
 	return username.Username + " " + hostname, nil
 
+}
+
+func (w *WebtunnelClient) configureInterfaceHelper(IP, GWIp, Netmask string, DNS, RoutePrefix []string, GWHWAddr net.HardwareAddr) error {
+	var dnsIPs []net.IP
+	for _, v := range DNS {
+		dnsIPs = append(dnsIPs, net.ParseIP(v).To4())
+	}
+	var routes []*net.IPNet
+	for _, v := range RoutePrefix {
+		_, n, err := net.ParseCIDR(v)
+		if err != nil {
+			return err
+		}
+		routes = append(routes, n)
+	}
+	w.ifce.IP = net.ParseIP(IP).To4()
+	w.ifce.GWIP = net.ParseIP(GWIp).To4()
+	w.ifce.Netmask = net.ParseIP(Netmask).To4()
+	w.ifce.DNS = dnsIPs
+	w.ifce.RoutePrefix = routes
+	w.ifce.GWHWAddr = wc.GenMACAddr()
+	glog.V(1).Infof("Remote Mac Hwdr: %v", w.ifce.GWHWAddr)
+	return nil
 }
 
 // configureInterface retrieves the client configuration from server and sends to Net daemon.
@@ -444,6 +558,7 @@ func (w *WebtunnelClient) processNetPacket() {
 				continue
 			}
 			if _, ok := packet.Layer(layers.LayerTypeDHCPv4).(*layers.DHCPv4); ok {
+				glog.V(1).Info("DHCP packet detected")
 				if err := w.handleDHCP(packet); err != nil {
 					w.Error <- fmt.Errorf("err sending dhcp  %v", err)
 				}
@@ -480,11 +595,12 @@ func (w *WebtunnelClient) buildDHCPopts(leaseTime uint32, msgType layers.DHCPMsg
 	tm := make([]byte, 4)
 	binary.BigEndian.PutUint32(tm, leaseTime)
 
-	var dnsbytes []byte
+	//var dnsbytes []byte
 	for _, s := range w.ifce.DNS {
-		dnsbytes = append(dnsbytes, s...)
+		opt = append(opt, layers.NewDHCPOption(layers.DHCPOptDNS, s))
+		//dnsbytes = append(dnsbytes, s...)
 	}
-	opt = append(opt, layers.NewDHCPOption(layers.DHCPOptDNS, dnsbytes))
+	//opt = append(opt, layers.NewDHCPOption(layers.DHCPOptDNS, dnsbytes))
 	opt = append(opt, layers.NewDHCPOption(layers.DHCPOptSubnetMask, w.ifce.Netmask))
 	opt = append(opt, layers.NewDHCPOption(layers.DHCPOptLeaseTime, tm))
 	opt = append(opt, layers.NewDHCPOption(layers.DHCPOptMessageType, []byte{byte(msgType)}))
@@ -627,10 +743,35 @@ func (w *WebtunnelClient) handleArp(packet gopacket.Packet) error {
 		DstHwAddress:      arp.SourceHwAddress,
 		DstProtAddress:    arp.SourceProtAddress,
 	}
-	ethl := &layers.Ethernet{
-		SrcMAC:       w.ifce.GWHWAddr,
-		DstMAC:       eth.SrcMAC,
-		EthernetType: layers.EthernetTypeARP,
+
+	glog.V(1).Infof("Arp Request is source hw: %v, source ip: %v, dest hw: %v, dest ip: %v",
+		arp.SourceHwAddress, arp.SourceProtAddress,
+		arp.DstHwAddress, arp.DstProtAddress,
+	)
+
+	glog.V(1).Infof("Arp Reply is source hw: %v, source ip: %v, dest hw: %v, dest ip: %v",
+		arpl.SourceHwAddress, arpl.SourceProtAddress,
+		arpl.DstHwAddress, arpl.DstProtAddress,
+	)
+
+	glog.V(1).Infof("Reply Source Mac is %v", net.HardwareAddr(arpl.SourceHwAddress))
+	glog.V(1).Infof("Reply Dest Mac is %v", net.HardwareAddr(arpl.DstHwAddress))
+	var ethl *layers.Ethernet
+	if net.IP.Equal(net.IP(arpl.SourceProtAddress), w.ifce.IP) {
+		glog.V(1).Info("Arp Reply source IP is VM")
+		glog.V(1).Info("Arp Reply source is VM - Ethernet source frame should be the local HWaddr")
+		arpl.SourceHwAddress = w.ifce.LocalHWAddr
+		ethl = &layers.Ethernet{
+			SrcMAC:       w.ifce.LocalHWAddr,
+			DstMAC:       eth.SrcMAC,
+			EthernetType: layers.EthernetTypeARP,
+		}
+	} else {
+		ethl = &layers.Ethernet{
+			SrcMAC:       w.ifce.GWHWAddr,
+			DstMAC:       eth.SrcMAC,
+			EthernetType: layers.EthernetTypeARP,
+		}
 	}
 
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
