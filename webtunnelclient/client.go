@@ -758,6 +758,10 @@ func (w *WebtunnelClient) handleArp(packet gopacket.Packet) error {
 	glog.V(1).Infof("Reply Dest Mac is %v", net.HardwareAddr(arpl.DstHwAddress))
 	var ethl *layers.Ethernet
 	if net.IP.Equal(net.IP(arpl.SourceProtAddress), w.ifce.IP) {
+		if w.ifce.LocalHWAddr == nil {
+			glog.V(1).Info("Interface is not yet ready - skipping arp replies for the VM itself")
+			return nil
+		}
 		glog.V(1).Info("Arp Reply source IP is VM")
 		glog.V(1).Info("Arp Reply source is VM - Ethernet source frame should be the local HWaddr")
 		arpl.SourceHwAddress = w.ifce.LocalHWAddr
