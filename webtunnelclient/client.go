@@ -223,13 +223,18 @@ func (w *WebtunnelClient) Start() error {
 	w.isWSReady = true
 
 	// Start network interface.
+	//Changing driver may require to change the server IP config - must be because
+	// even thought the older interface is down - lease may still be active so interface cannot get the IP
+	// this might be fixed by just rebooting or I think resetting winsock
 	glog.V(1).Info("Initialize TAP network interface")
 	handle, err := NewWaterInterface(water.Config{
 		DeviceType: w.devType,
 		PlatformSpecificParams: water.PlatformSpecificParams{
 			ComponentID:   "tap_ovpnconnect",
 			InterfaceName: "Local Area Connection",
-			Network:       "192.168.50.0/24",
+			//ComponentID:   "tapoas",
+			//InterfaceName: "Local Area Connection 2",
+			Network: "192.168.50.0/24",
 		},
 	})
 	if err != nil {
