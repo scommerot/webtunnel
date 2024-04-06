@@ -160,20 +160,26 @@ func (r *WebTunnelServer) Start() {
 
 func (r *WebTunnelServer) serveClients() {
 	// Start the HTTP Server.
-	http.HandleFunc("/", r.httpEndpoint)
-	http.HandleFunc("/ws", r.wsEndpoint)
-	http.HandleFunc("/metrichealthz", r.healthEndpoint)
-	http.HandleFunc("/metricvarz", r.metricEndpoint)
+	mux := http.NewServeMux()
+	s := &http.Server{
+		Addr:    r.serverIPPort,
+		Handler: mux,
+	}
+
+	mux.HandleFunc("/", r.httpEndpoint)
+	mux.HandleFunc("/ws", r.wsEndpoint)
+	mux.HandleFunc("/metrichealthz", r.healthEndpoint)
+	mux.HandleFunc("/metricvarz", r.metricEndpoint)
 
 	// Start the custom handlers.
 	for e, h := range r.customHTTPHandlers {
-		http.Handle(e, h)
+		mux.Handle(e, h)
 	}
 
 	if r.secure {
-		log.Fatal(http.ListenAndServeTLS(r.serverIPPort, r.httpsCertFile, r.httpsKeyFile, nil))
+		log.Fatal(s.ListenAndServeTLS(r.httpsCertFile, r.httpsKeyFile))
 	} else {
-		log.Fatal(http.ListenAndServe(r.serverIPPort, nil))
+		log.Fatal(s.ListenAndServe())
 	}
 }
 
